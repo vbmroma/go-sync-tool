@@ -1,0 +1,776 @@
+package main
+
+import (
+	"crypto/sha256"
+	"encoding/csv"
+	"encoding/json"
+	"fmt"
+	"html/template"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+)
+
+//================================================================//
+// 1. MODELS (models/data_models.go)
+// Definição das estruturas de dados da aplicação.
+//================================================================//
+
+// FileMetadata armazena informações sobre um único arquivo.
+type FileMetadata struct {
+	Path    string    `json:"path"`
+	Size    int64     `json:"size"`
+	ModTime time.Time `json:"mod_time"`
+	Hash    string    `json:"hash"`
+}
+
+// CollectionReport armazena o resultado de uma varredura de diretório.
+type CollectionReport struct {
+	Type      string         `json:"type"` // "source" ou "destination"
+	RootPath  string         `json:"root_path"`
+	Files     []FileMetadata `json:"files"`
+	Timestamp time.Time      `json:"timestamp"`
+}
+
+// ComparisonResult armazena o resultado da comparação entre dois relatórios.
+type ComparisonResult struct {
+	SourceReport      string         `json:"source_report"`
+	DestinationReport string         `json:"destination_report"`
+	MissingInDest     []FileMetadata `json:"missing_in_dest"`
+	DifferentInDest   []FileMetadata `json:"different_in_dest"`
+	OnlyInDest        []FileMetadata `json:"only_in_dest"`
+	Timestamp         time.Time      `json:"timestamp"`
+}
+
+// CopyResult armazena o resultado de uma operação de cópia.
+type CopyResult struct {
+	ComparisonReport string   `json:"comparison_report"`
+	CopiedFiles      []string `json:"copied_files"`
+	FailedFiles      []string `json:"failed_files"`
+	Timestamp        time.Time `json:"timestamp"`
+}
+
+//================================================================//
+// 2. WEBSOCKET HUB (handlers/ws_handlers.go)
+// Lógica para comunicação em tempo real com o frontend.
+//================================================================//
+
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	CheckOrigin:     func(r *http.Request) bool { return true }, // Permite todas as origens
+}
+
+// Hub mantém o conjunto de clientes ativos e transmite mensagens para eles.
+type Hub struct {
+	clients    map[*websocket.Conn]bool
+	broadcast  chan []byte
+	register   chan *websocket.Conn
+	unregister chan *websocket.Conn
+	mu         sync.Mutex
+}
+
+func newHub() *Hub {
+	return &Hub{
+		broadcast:  make(chan []byte),
+		register:   make(chan *websocket.Conn),
+		unregister: make(chan *websocket.Conn),
+		clients:    make(map[*websocket.Conn]bool),
+	}
+}
+
+func (h *Hub) run() {
+	for {
+		select {
+		case client := <-h.register:
+			h.mu.Lock()
+			h.clients[client] = true
+			h.mu.Unlock()
+			log.Println("Cliente WebSocket conectado.")
+		case client := <-h.unregister:
+			h.mu.Lock()
+			if _, ok := h.clients[client]; ok {
+				delete(h.clients, client)
+				client.Close()
+				log.Println("Cliente WebSocket desconectado.")
+			}
+			h.mu.Unlock()
+		case message := <-h.broadcast:
+			h.mu.Lock()
+			for client := range h.clients {
+				err := client.WriteMessage(websocket.TextMessage, message)
+				if err != nil {
+					log.Printf("Erro ao enviar mensagem via websocket: %v", err)
+					client.Close()
+					delete(h.clients, client)
+				}
+			}
+			h.mu.Unlock()
+		}
+	}
+}
+
+// Global Hub instance
+var hub *Hub
+
+//================================================================//
+// 3. CORE LOGIC (core/)
+// Funções de alta performance para as operações principais.
+//================================================================//
+
+// --- Collector (core/collector.go) ---
+
+func calculateHash(filePath string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
+// CollectFiles varre um diretório de forma concorrente para coletar metadados de arquivos.
+func CollectFiles(rootPath, reportType string) {
+	hub.broadcast <- []byte(fmt.Sprintf("Iniciando coleta para: %s", rootPath))
+
+	var wg sync.WaitGroup
+	numWorkers := runtime.NumCPU()
+	jobs := make(chan string, numWorkers)
+	results := make(chan FileMetadata, 1000) // Buffer para não bloquear os workers
+
+	// Inicia os workers para processar os arquivos
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for path := range jobs {
+				info, err := os.Stat(path)
+				if err != nil {
+					hub.broadcast <- []byte(fmt.Sprintf("ERRO ao ler info de %s: %v", path, err))
+					continue
+				}
+
+				if info.IsDir() {
+					continue
+				}
+
+				hash, err := calculateHash(path)
+				if err != nil {
+					hub.broadcast <- []byte(fmt.Sprintf("ERRO ao calcular hash de %s: %v", path, err))
+					continue
+				}
+				
+				relPath, _ := filepath.Rel(rootPath, path)
+
+				results <- FileMetadata{
+					Path:    relPath,
+					Size:    info.Size(),
+					ModTime: info.ModTime(),
+					Hash:    hash,
+				}
+				hub.broadcast <- []byte(fmt.Sprintf("Coletado: %s", relPath))
+			}
+		}()
+	}
+
+	// Goroutine para percorrer a árvore de diretórios e enviar para o canal de jobs
+	go func() {
+		filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() {
+				jobs <- path
+			}
+			return nil
+		})
+		close(jobs)
+	}()
+
+	// Goroutine para fechar o canal de resultados quando todos os workers terminarem
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Coleta os resultados
+	var collectedFiles []FileMetadata
+	for res := range results {
+		collectedFiles = append(collectedFiles, res)
+	}
+
+	report := CollectionReport{
+		Type:      reportType,
+		RootPath:  rootPath,
+		Files:     collectedFiles,
+		Timestamp: time.Now(),
+	}
+
+	// Salva o relatório em JSON
+	fileName := fmt.Sprintf("collected_data/%s_%s.json", reportType, time.Now().Format("20060102_150405"))
+	file, err := os.Create(fileName)
+	if err != nil {
+		hub.broadcast <- []byte(fmt.Sprintf("ERRO ao criar arquivo de relatório: %v", err))
+		return
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(report); err != nil {
+		hub.broadcast <- []byte(fmt.Sprintf("ERRO ao salvar relatório JSON: %v", err))
+		return
+	}
+
+	hub.broadcast <- []byte(fmt.Sprintf("Coleta finalizada! Relatório salvo em: %s", fileName))
+}
+
+// --- Comparator (core/comparator.go) ---
+
+// CompareReports compara dois relatórios de coleta e gera um resultado.
+func CompareReports(sourceFile, destFile string) {
+	hub.broadcast <- []byte(fmt.Sprintf("Iniciando comparação entre %s e %s", sourceFile, destFile))
+
+	// Carrega o relatório de origem
+	sourceReport := CollectionReport{}
+	f, err := os.Open(filepath.Join("collected_data", sourceFile))
+	if err != nil {
+		hub.broadcast <- []byte(fmt.Sprintf("ERRO ao abrir relatório de origem: %v", err))
+		return
+	}
+	json.NewDecoder(f).Decode(&sourceReport)
+	f.Close()
+
+	// Carrega o relatório de destino
+	destReport := CollectionReport{}
+	f, err = os.Open(filepath.Join("collected_data", destFile))
+	if err != nil {
+		hub.broadcast <- []byte(fmt.Sprintf("ERRO ao abrir relatório de destino: %v", err))
+		return
+	}
+	json.NewDecoder(f).Decode(&destReport)
+	f.Close()
+
+	// Cria maps para comparação O(1)
+	sourceMap := make(map[string]FileMetadata)
+	for _, file := range sourceReport.Files {
+		sourceMap[file.Path] = file
+	}
+	destMap := make(map[string]FileMetadata)
+	for _, file := range destReport.Files {
+		destMap[file.Path] = file
+	}
+
+	result := ComparisonResult{
+		SourceReport:      sourceFile,
+		DestinationReport: destFile,
+		Timestamp:         time.Now(),
+	}
+
+	// Compara os arquivos
+	for path, sourceMeta := range sourceMap {
+		destMeta, exists := destMap[path]
+		if !exists {
+			result.MissingInDest = append(result.MissingInDest, sourceMeta)
+		} else if sourceMeta.Hash != destMeta.Hash {
+			result.DifferentInDest = append(result.DifferentInDest, sourceMeta)
+		}
+	}
+	
+	for path, destMeta := range destMap {
+		if _, exists := sourceMap[path]; !exists {
+			result.OnlyInDest = append(result.OnlyInDest, destMeta)
+		}
+	}
+
+	// Salva o resultado em JSON
+	baseName := fmt.Sprintf("comparison_%s", time.Now().Format("20060102_150405"))
+	jsonFileName := fmt.Sprintf("comparison_results/%s.json", baseName)
+	file, err := os.Create(jsonFileName)
+	if err != nil {
+		hub.broadcast <- []byte(fmt.Sprintf("ERRO ao criar arquivo de comparação JSON: %v", err))
+		return
+	}
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	encoder.Encode(result)
+	file.Close()
+	hub.broadcast <- []byte(fmt.Sprintf("Relatório de comparação JSON salvo em: %s", jsonFileName))
+
+	// Salva o resultado em CSV
+	csvFileName := fmt.Sprintf("comparison_results/%s.csv", baseName)
+	csvFile, err := os.Create(csvFileName)
+	if err != nil {
+		hub.broadcast <- []byte(fmt.Sprintf("ERRO ao criar arquivo de comparação CSV: %v", err))
+		return
+	}
+	defer csvFile.Close()
+
+	writer := csv.NewWriter(csvFile)
+	writer.Write([]string{"status", "path", "size", "hash"})
+	for _, f := range result.MissingInDest {
+		writer.Write([]string{"MISSING_IN_DEST", f.Path, fmt.Sprint(f.Size), f.Hash})
+	}
+	for _, f := range result.DifferentInDest {
+		writer.Write([]string{"DIFFERENT", f.Path, fmt.Sprint(f.Size), f.Hash})
+	}
+	for _, f := range result.OnlyInDest {
+		writer.Write([]string{"ONLY_IN_DEST", f.Path, fmt.Sprint(f.Size), f.Hash})
+	}
+	writer.Flush()
+	hub.broadcast <- []byte(fmt.Sprintf("Relatório de comparação CSV salvo em: %s", csvFileName))
+	hub.broadcast <- []byte("Comparação finalizada!")
+}
+
+// --- Copier (core/copier.go) ---
+
+// CopyFiles copia os arquivos ausentes/diferentes com base em um relatório de comparação.
+func CopyFiles(comparisonFile string) {
+	hub.broadcast <- []byte(fmt.Sprintf("Iniciando cópia com base no relatório: %s", comparisonFile))
+
+	// Carrega o relatório de comparação
+	compReport := ComparisonResult{}
+	f, err := os.Open(filepath.Join("comparison_results", comparisonFile))
+	if err != nil {
+		hub.broadcast <- []byte(fmt.Sprintf("ERRO ao abrir relatório de comparação: %v", err))
+		return
+	}
+	json.NewDecoder(f).Decode(&compReport)
+	f.Close()
+
+	// Carrega os relatórios de coleta originais para obter os caminhos raiz
+	sourceReport := CollectionReport{}
+	f, err = os.Open(filepath.Join("collected_data", compReport.SourceReport))
+	if err != nil {
+		hub.broadcast <- []byte(fmt.Sprintf("ERRO ao abrir relatório de origem para cópia: %v", err))
+		return
+	}
+	json.NewDecoder(f).Decode(&sourceReport)
+	f.Close()
+
+	destReport := CollectionReport{}
+	f, err = os.Open(filepath.Join("collected_data", compReport.DestinationReport))
+	if err != nil {
+		hub.broadcast <- []byte(fmt.Sprintf("ERRO ao abrir relatório de destino para cópia: %v", err))
+		return
+	}
+	json.NewDecoder(f).Decode(&destReport)
+	f.Close()
+
+	sourceRoot := sourceReport.RootPath
+	destRoot := destReport.RootPath
+
+	// Lista de arquivos a serem copiados
+	filesToCopy := append(compReport.MissingInDest, compReport.DifferentInDest...)
+
+	if len(filesToCopy) == 0 {
+		hub.broadcast <- []byte("Nenhum arquivo para copiar.")
+		return
+	}
+
+	var wg sync.WaitGroup
+	numWorkers := runtime.NumCPU()
+	jobs := make(chan FileMetadata, numWorkers)
+	copyResultsChan := make(chan string, len(filesToCopy)) // Canal para resultados de cópia
+
+	// Inicia os workers de cópia
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for meta := range jobs {
+				sourcePath := filepath.Join(sourceRoot, meta.Path)
+				destPath := filepath.Join(destRoot, meta.Path)
+
+				hub.broadcast <- []byte(fmt.Sprintf("Copiando: %s -> %s", sourcePath, destPath))
+
+				// Garante que o diretório de destino exista
+				if err := os.MkdirAll(filepath.Dir(destPath), os.ModePerm); err != nil {
+					copyResultsChan <- fmt.Sprintf("FALHA: %s (erro ao criar dir: %v)", meta.Path, err)
+					continue
+				}
+
+				// Copia o arquivo
+				srcFile, err := os.Open(sourcePath)
+				if err != nil {
+					copyResultsChan <- fmt.Sprintf("FALHA: %s (erro ao abrir origem: %v)", meta.Path, err)
+					continue
+				}
+				
+				dstFile, err := os.Create(destPath)
+				if err != nil {
+					srcFile.Close()
+					copyResultsChan <- fmt.Sprintf("FALHA: %s (erro ao criar destino: %v)", meta.Path, err)
+					continue
+				}
+
+				_, err = io.Copy(dstFile, srcFile)
+				srcFile.Close()
+				dstFile.Close()
+
+				if err != nil {
+					copyResultsChan <- fmt.Sprintf("FALHA: %s (erro ao copiar: %v)", meta.Path, err)
+				} else {
+					copyResultsChan <- fmt.Sprintf("SUCESSO: %s", meta.Path)
+				}
+			}
+		}()
+	}
+
+	// Envia os arquivos para o canal de jobs
+	go func() {
+		for _, meta := range filesToCopy {
+			jobs <- meta
+		}
+		close(jobs)
+	}()
+
+	// Aguarda a finalização dos workers
+	go func() {
+		wg.Wait()
+		close(copyResultsChan)
+	}()
+
+	// Coleta os resultados da cópia
+	copyResult := CopyResult{
+		ComparisonReport: comparisonFile,
+		Timestamp:        time.Now(),
+	}
+	for res := range copyResultsChan {
+		if strings.HasPrefix(res, "SUCESSO:") {
+			copyResult.CopiedFiles = append(copyResult.CopiedFiles, strings.TrimPrefix(res, "SUCESSO: "))
+		} else {
+			copyResult.FailedFiles = append(copyResult.FailedFiles, strings.TrimPrefix(res, "FALHA: "))
+		}
+	}
+
+	// Salva o relatório de cópia
+	fileName := fmt.Sprintf("copy_report_%s.json", time.Now().Format("20060102_150405"))
+	file, err := os.Create(fileName)
+	if err != nil {
+		hub.broadcast <- []byte(fmt.Sprintf("ERRO ao criar relatório de cópia: %v", err))
+		return
+	}
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	encoder.Encode(copyResult)
+	file.Close()
+
+	hub.broadcast <- []byte(fmt.Sprintf("Operação de cópia finalizada! Relatório salvo em: %s", fileName))
+}
+
+//================================================================//
+// 4. HTTP HANDLERS (handlers/api_handlers.go)
+// Lógica para as rotas da API REST.
+//================================================================//
+
+func handleCollect(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path string `json:"path"`
+		Type string `json:"type"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	go CollectFiles(req.Path, req.Type)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "success", "message": "Coleta iniciada."})
+}
+
+func handleCompare(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SourceFile string `json:"source_file"`
+		DestFile   string `json:"dest_file"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	go CompareReports(req.SourceFile, req.DestFile)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "success", "message": "Comparação iniciada."})
+}
+
+func handleCopy(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ComparisonFile string `json:"comparison_file"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	go CopyFiles(req.ComparisonFile)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "success", "message": "Cópia iniciada."})
+}
+
+func serveWs(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Println("Erro no upgrade do websocket:", err)
+		return
+	}
+	hub.register <- conn
+
+	// Garante que o cliente seja desregistrado ao sair
+	defer func() {
+		hub.unregister <- conn
+	}()
+
+	// Mantém a conexão viva (necessário para o defer funcionar)
+	for {
+		// Apenas lemos para detectar quando o cliente fecha a conexão
+		if _, _, err := conn.ReadMessage(); err != nil {
+			break
+		}
+	}
+}
+
+//================================================================//
+// 5. FRONTEND (ui/)
+// Servindo os arquivos HTML, CSS e JS embutidos.
+//================================================================//
+
+const indexHTML = `
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GoLang Sync Tool</title>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Roboto', sans-serif;
+            background-color: #121212;
+            color: #e0e0e0;
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .container {
+            width: 90%;
+            max-width: 1200px;
+            background-color: #1e1e1e;
+            padding: 25px;
+            border-radius: 8px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+        }
+        h1, h2 {
+            color: #bb86fc;
+            border-bottom: 2px solid #373737;
+            padding-bottom: 10px;
+            font-weight: 300;
+        }
+        .card {
+            background-color: #2c2c2c;
+            padding: 20px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 700;
+            color: #cfcfcf;
+        }
+        input[type="text"] {
+            width: calc(100% - 22px);
+            padding: 10px;
+            border-radius: 4px;
+            border: 1px solid #444;
+            background-color: #333;
+            color: #e0e0e0;
+            font-size: 16px;
+        }
+        button {
+            background-color: #03dac6;
+            color: #121212;
+            border: none;
+            padding: 12px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 700;
+            transition: background-color 0.3s ease;
+            margin-top: 10px;
+        }
+        button:hover {
+            background-color: #018786;
+        }
+        #logs {
+            background-color: #252525;
+            height: 400px;
+            overflow-y: scroll;
+            padding: 15px;
+            border-radius: 6px;
+            border: 1px solid #373737;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 14px;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>GoLang High Performance Sync Tool</h1>
+
+        <div class="card">
+            <h2>1. Coletar Dados</h2>
+            <label for="source-path">Caminho da Origem:</label>
+            <input type="text" id="source-path" placeholder="Ex: /caminho/para/origem">
+            <button id="collect-source">Coletar Origem</button>
+            <br><br>
+            <label for="dest-path">Caminho do Destino:</label>
+            <input type="text" id="dest-path" placeholder="Ex: /caminho/para/destino">
+            <button id="collect-dest">Coletar Destino</button>
+        </div>
+
+        <div class="card">
+            <h2>2. Comparar Relatórios</h2>
+            <label for="source-json">Arquivo JSON da Origem:</label>
+            <input type="text" id="source-json" placeholder="Ex: source_20230101_120000.json">
+            <br><br>
+            <label for="dest-json">Arquivo JSON do Destino:</label>
+            <input type="text" id="dest-json" placeholder="Ex: destination_20230101_120500.json">
+            <button id="compare-jsons">Comparar</button>
+        </div>
+
+        <div class="card">
+            <h2>3. Copiar Arquivos</h2>
+            <label for="comparison-json">Arquivo JSON de Comparação:</label>
+            <input type="text" id="comparison-json" placeholder="Ex: comparison_20230101_121000.json">
+            <button id="copy-files">Iniciar Cópia</button>
+        </div>
+
+        <h2>Logs em Tempo Real</h2>
+        <div id="logs">Conectando ao servidor...</div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const logs = document.getElementById('logs');
+            const ws = new WebSocket('ws://' + window.location.host + '/ws');
+
+            ws.onopen = () => {
+                logs.innerHTML = 'Conectado ao servidor com sucesso.\n';
+            };
+
+            ws.onmessage = (event) => {
+                logs.innerHTML += event.data + '\n';
+                logs.scrollTop = logs.scrollHeight; // Auto-scroll
+            };
+
+            ws.onclose = () => {
+                logs.innerHTML += 'Conexão perdida. Tentando reconectar...\n';
+            };
+
+            ws.onerror = (error) => {
+                logs.innerHTML += 'Erro na conexão WebSocket.\n';
+                console.error('WebSocket Error:', error);
+            };
+
+            function postRequest(url, body) {
+                return fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+            }
+
+            document.getElementById('collect-source').addEventListener('click', () => {
+                const path = document.getElementById('source-path').value;
+                if (!path) { alert('Por favor, informe o caminho da origem.'); return; }
+                postRequest('/collect', { path: path, type: 'source' });
+            });
+
+            document.getElementById('collect-dest').addEventListener('click', () => {
+                const path = document.getElementById('dest-path').value;
+                if (!path) { alert('Por favor, informe o caminho do destino.'); return; }
+                postRequest('/collect', { path: path, type: 'destination' });
+            });
+
+            document.getElementById('compare-jsons').addEventListener('click', () => {
+                const sourceFile = document.getElementById('source-json').value;
+                const destFile = document.getElementById('dest-json').value;
+                if (!sourceFile || !destFile) { alert('Por favor, informe os dois arquivos JSON.'); return; }
+                postRequest('/compare', { source_file: sourceFile, dest_file: destFile });
+            });
+
+            document.getElementById('copy-files').addEventListener('click', () => {
+                const comparisonFile = document.getElementById('comparison-json').value;
+                if (!comparisonFile) { alert('Por favor, informe o arquivo de comparação.'); return; }
+                postRequest('/copy', { comparison_file: comparisonFile });
+            });
+        });
+    </script>
+</body>
+</html>
+`
+
+func serveHome(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	tmpl, err := template.New("index").Parse(indexHTML)
+	if err != nil {
+		http.Error(w, "Erro ao parsear o template HTML", http.StatusInternalServerError)
+		return
+	}
+	tmpl.Execute(w, nil)
+}
+
+//================================================================//
+// 6. MAIN (main.go)
+// Ponto de entrada da aplicação.
+//================================================================//
+
+func main() {
+	// Cria os diretórios de saída se não existirem
+	os.MkdirAll("collected_data", os.ModePerm)
+	os.MkdirAll("comparison_results", os.ModePerm)
+
+	hub = newHub()
+	go hub.run()
+
+	// Rotas da API
+	http.HandleFunc("/collect", handleCollect)
+	http.HandleFunc("/compare", handleCompare)
+	http.HandleFunc("/copy", handleCopy)
+
+	// Rota do WebSocket
+	http.HandleFunc("/ws", serveWs)
+
+	// Rota principal que serve o frontend
+	http.HandleFunc("/", serveHome)
+
+	port := "8080"
+	log.Printf("Servidor iniciado em http://localhost:%s", port)
+	log.Println("Aguardando requisições...")
+	err := http.ListenAndServe(":"+port, nil)
+	if err != nil {
+		log.Fatalf("Falha ao iniciar o servidor: %v", err)
+	}
+}
