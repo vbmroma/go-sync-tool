@@ -45,7 +45,7 @@ Sincronizar diretórios com dezenas de milhares de arquivos (50.000+) pode ser u
 
 1.  Clone o repositório:
     ```bash
-    git clone [https://github.com/seu-usuario/go-sync-tool.git](https://github.com/seu-usuario/go-sync-tool.git)
+    git clone [https://github.com/vbmroma/go-sync-tool.git](https://github.com/vbmroma/go-sync-tool.git)
     cd go-sync-tool
     ```
 
@@ -73,5 +73,6 @@ Sincronizar diretórios com dezenas de milhares de arquivos (50.000+) pode ser u
 4.  **Visualizar Relatórios:** Use os botões "Visualizar" nas seções 3 e 4 para abrir os relatórios de comparação ou de cópia em uma nova aba do navegador.
 
 ## Licença
+
 
 Este projeto está licenciado sob a Licença MIT. Veja o arquivo `LICENSE` para mais detalhes.
